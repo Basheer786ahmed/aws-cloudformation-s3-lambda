@@ -1,0 +1,175 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation script for automated EC2, S3, Lambda, and SNS integration.'
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: The instance type for the EC2 machine.
+  NotificationEmail:
+    Type: String
+    Description: Enter your email address to receive immediate SNS updates.
+
+Resources:
+  # ==========================================
+  # 1. EC2 INSTANCE & IAM ROLE CONFIGURATION
+  # ==========================================
+  Ec2IamRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2010-09-09'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess'
+
+  Ec2InstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Roles:
+        - !Ref Ec2IamRole
+
+  Ec2Instance:
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref Ec2InstanceProfile
+      ImageId: !Ref LatestAmiId 
+      Tags:
+        - Key: Name
+          Value: Project-Workstation
+
+  # Dynamic lookup to always pull the latest stable Amazon Linux 2023 image
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64'
+
+  # ==========================================
+  # 2. SNS TOPIC CONFIGURATION
+  # ==========================================
+  SnsTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      TopicName: project-s3-event-notification-topic
+
+  SnsSubscription:
+    Type: 'AWS::SNS::Subscription'
+    Properties:
+      TopicArn: !Ref SnsTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # ==========================================
+  # 3. LAMBDA FUNCTION & ROLES
+  # ==========================================
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2010-09-09'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: LambdaSnsAndLogsPolicy
+          PolicyDocument:
+            Version: '2010-09-09'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: 'arn:aws:logs:*:*:*'
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref SnsTopic
+
+  LambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.11
+      Timeout: 30
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref SnsTopic
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          sns_client = boto3.client('sns')
+          SNS_TOPIC_ARN = os.environ['SNS_TOPIC_ARN']
+
+          def handler(event, context):
+              print("Received Event Payload: " + json.dumps(event))
+              
+              for record in event.get('Records', []):
+                  bucket_name = record['s3']['bucket']['name']
+                  object_key = record['s3']['object']['key']
+                  
+                  notification_message = (
+                      f"Success! A new object was created in your S3 bucket.\n\n"
+                      f"Bucket Name: {bucket_name}\n"
+                      f"Object Key: {object_key}\n"
+                  )
+                  
+                  # Publish event straight to SNS
+                  sns_client.publish(
+                      TopicArn=SNS_TOPIC_ARN,
+                      Subject="AWS Notification: S3 Object Created",
+                      Message=notification_message
+                  )
+                  
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Execution completed and message published.')
+              }
+
+  # Gives permission to the S3 Service to invoke this specific Lambda Function
+  LambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt LambdaFunction.Arn
+      Principal: 's3.amazonaws.com'
+      SourceAccount: !Ref 'AWS::AccountId'
+
+  # ==========================================
+  # 4. S3 BUCKET CONFIGURATION
+  # ==========================================
+  S3Bucket:
+    Type: 'AWS::S3::Bucket'
+    DependsOn: LambdaPermission
+    Properties:
+      # Ensures global uniqueness by embedding your Account ID & Region name
+      BucketName: !Sub 'project-s3-bucket-${AWS::AccountId}-${AWS::Region}'
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt LambdaFunction.Arn
+
+Outputs:
+  CreatedS3Bucket:
+    Value: !Ref S3Bucket
+    Description: Unique bucket identifier.
+  SnsTopicArn:
+    Value: !Ref SnsTopic
+    Description: Target ARN for notifications.
+  Ec2InstanceId:
+    Value: !Ref Ec2Instance
+    Description: Provisioned EC2 Instance ID.
